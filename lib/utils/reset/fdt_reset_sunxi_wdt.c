@@ -14,10 +14,15 @@
 
 #define WDT_KEY_VAL			0x16aa0000
 
-#define WDT_SOFT_RST_REG		0x08
-#define WDT_SOFT_RST_EN			BIT(0)
+#define WDT_CTRL_REG			0x10
+#define WDT_CTRL_RELOAD			(BIT(0) | (0x0a57 << 1))
+
+#define WDT_CFG_REG			0x14
+#define WDT_CFG_RESET_MASK		0x03
+#define WDT_CFG_RESET_ON_TIMEOUT	0x01
 
 #define WDT_MODE_REG			0x18
+#define WDT_MODE_EN			BIT(0)
 
 static volatile char *sunxi_wdt_base;
 
@@ -34,13 +39,28 @@ static int sunxi_wdt_system_reset_check(u32 type, u32 reason)
 
 static void sunxi_wdt_system_reset(u32 type, u32 reason)
 {
-	/* Disable the watchdog. */
-	writel_relaxed(WDT_KEY_VAL,
-		       sunxi_wdt_base + WDT_MODE_REG);
+	u32 val;
 
-	/* Trigger soft reset. */
-	writel_relaxed(WDT_KEY_VAL | WDT_SOFT_RST_EN,
-		       sunxi_wdt_base + WDT_SOFT_RST_REG);
+	/* Set CFG register to generate reset on watchdog timeout. */
+	val = readl_relaxed(sunxi_wdt_base + WDT_CFG_REG);
+	val &= ~WDT_CFG_RESET_MASK;
+	val |= WDT_CFG_RESET_ON_TIMEOUT;
+	val |= WDT_KEY_VAL;
+	writel_relaxed(val, sunxi_wdt_base + WDT_CFG_REG);
+
+	/* Enable watchdog with the lowest timeout interval. */
+	val = readl_relaxed(sunxi_wdt_base + WDT_MODE_REG);
+	val &= ~(0x0f << 4);	/* Clear timeout field = shortest timeout */
+	val |= WDT_MODE_EN;
+	val |= WDT_KEY_VAL;
+	writel_relaxed(val, sunxi_wdt_base + WDT_MODE_REG);
+
+	/* Reload the watchdog to start the countdown. */
+	writel_relaxed(WDT_CTRL_RELOAD, sunxi_wdt_base + WDT_CTRL_REG);
+
+	/* Wait for the watchdog to expire and reset the SoC. */
+	while (1)
+		;
 }
 
 static struct sbi_system_reset_device sunxi_wdt_reset = {
@@ -68,6 +88,7 @@ static int sunxi_wdt_reset_init(const void *fdt, int nodeoff,
 
 static const struct fdt_match sunxi_wdt_reset_match[] = {
 	{ .compatible = "allwinner,sun20i-d1-wdt-reset" },
+	{ .compatible = "allwinner,sun20i-d1-wdt" },
 	{ },
 };
 
