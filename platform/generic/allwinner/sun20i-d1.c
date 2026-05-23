@@ -16,6 +16,7 @@
 #include <sbi/sbi_platform.h>
 #include <sbi/sbi_pmu.h>
 #include <sbi/sbi_scratch.h>
+#include <sbi/sbi_system.h>
 #include <sbi_utils/fdt/fdt_fixup.h>
 #include <sbi_utils/fdt/fdt_helper.h>
 #include <sbi_utils/irqchip/plic.h>
@@ -131,6 +132,68 @@ static void sun20i_d1_riscv_cfg_init(void)
 	writel_relaxed(entry >> 32, SUN20I_D1_RISCV_CFG_BASE + RESET_ENTRY_HI_REG);
 }
 
+/*
+ * WDT
+ */
+
+#define SUN20I_D1_WDT_BASE		(SUN20I_D1_RISCV_CFG_BASE + 0x1000)
+
+#define WDT_KEY_VAL			0x16aa0000
+#define WDT_CTRL_REG			0x10
+#define WDT_CTRL_RELOAD			(BIT(0) | (0x0a57 << 1))
+#define WDT_CFG_REG			0x14
+#define WDT_CFG_RESET_MASK		0x03
+#define WDT_CFG_RESET_ON_TIMEOUT	0x01
+#define WDT_MODE_REG			0x18
+#define WDT_MODE_EN			BIT(0)
+
+static int sun20i_d1_system_reset_check(u32 type, u32 reason)
+{
+	switch (type) {
+	case SBI_SRST_RESET_TYPE_COLD_REBOOT:
+	case SBI_SRST_RESET_TYPE_WARM_REBOOT:
+		return 1;
+	}
+
+	return 0;
+}
+
+static void sun20i_d1_system_reset(u32 type, u32 reason)
+{
+	u32 val;
+
+	/* Ensure the RISCV_CFG bus clock is enabled for watchdog access. */
+	writel_relaxed(CCU_BGR_ENABLE,
+		       SUN20I_D1_CCU_BASE + RISCV_CFG_BGR_REG);
+
+	/* Set CFG register to generate reset on watchdog timeout. */
+	val = readl_relaxed(SUN20I_D1_WDT_BASE + WDT_CFG_REG);
+	val &= ~WDT_CFG_RESET_MASK;
+	val |= WDT_CFG_RESET_ON_TIMEOUT;
+	val |= WDT_KEY_VAL;
+	writel_relaxed(val, SUN20I_D1_WDT_BASE + WDT_CFG_REG);
+
+	/* Enable watchdog with the lowest timeout interval. */
+	val = readl_relaxed(SUN20I_D1_WDT_BASE + WDT_MODE_REG);
+	val &= ~(0x0f << 4);	/* Clear timeout field = shortest timeout */
+	val |= WDT_MODE_EN;
+	val |= WDT_KEY_VAL;
+	writel_relaxed(val, SUN20I_D1_WDT_BASE + WDT_MODE_REG);
+
+	/* Reload the watchdog to start the countdown. */
+	writel_relaxed(WDT_CTRL_RELOAD, SUN20I_D1_WDT_BASE + WDT_CTRL_REG);
+
+	/* Wait for the watchdog to expire and reset the SoC. */
+	while (1)
+		;
+}
+
+static struct sbi_system_reset_device sun20i_d1_reset = {
+	.name = "sun20i-d1-wdt",
+	.system_reset_check = sun20i_d1_system_reset_check,
+	.system_reset = sun20i_d1_system_reset,
+};
+
 static int sun20i_d1_hart_suspend(u32 suspend_type, ulong mmode_resume_addr)
 {
 	/* Use the generic code for retentive suspend. */
@@ -221,11 +284,14 @@ static int sun20i_d1_platform_init(const void *fdt, int nodeoff,
 	generic_platform_ops.final_init = sun20i_d1_final_init;
 	generic_platform_ops.extensions_init = sun20i_d1_extensions_init;
 
+	sbi_system_reset_add_device(&sun20i_d1_reset);
+
 	return 0;
 }
 
 static const struct fdt_match sun20i_d1_match[] = {
 	{ .compatible = "allwinner,sun20i-d1" },
+	{ .compatible = "allwinner,sun20i-d1s" },
 	{ },
 };
 
