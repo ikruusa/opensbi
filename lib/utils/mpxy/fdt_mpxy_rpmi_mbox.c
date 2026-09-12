@@ -299,6 +299,8 @@ int mpxy_rpmi_mbox_init(const void *fdt, int nodeoff, const struct fdt_match *ma
 	/* Setup MPXY mbox client */
 	/* Channel ID*/
 	rmb->channel.channel_id = channel_id;
+	/* Set the owner domain */
+	rmb->channel.owner_domain = &root;
 	/* Callback for read RPMI attributes */
 	rmb->channel.read_attributes = mpxy_mbox_read_attributes;
 	/* Callback for write RPMI attributes */

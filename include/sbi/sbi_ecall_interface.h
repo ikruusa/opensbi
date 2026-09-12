@@ -271,6 +271,8 @@ struct sbi_pmu_event_info {
 #define SBI_PMU_EVENT_IDX_TYPE_OFFSET 16
 #define SBI_PMU_EVENT_IDX_TYPE_MASK (0xF << SBI_PMU_EVENT_IDX_TYPE_OFFSET)
 #define SBI_PMU_EVENT_IDX_CODE_MASK 0xFFFF
+#define SBI_PMU_EVENT_IDX_MBZ_OFFSET 20
+#define SBI_PMU_EVENT_IDX_MBZ_MASK (0xFFF << SBI_PMU_EVENT_IDX_MBZ_OFFSET)
 #define SBI_PMU_EVENT_RAW_IDX 0x20000
 #define SBI_PMU_EVENT_RAW_V2_IDX 0x30000
 
@@ -304,10 +306,22 @@ struct sbi_pmu_event_info {
 /* Flags defined for counter start function */
 #define SBI_PMU_START_FLAG_SET_INIT_VALUE (1 << 0)
 #define SBI_PMU_START_FLAG_INIT_FROM_SNAPSHOT (1 << 1)
+/* Start flags valid mask */
+#define SBI_PMU_START_FLAGS_MASK	\
+	( \
+		SBI_PMU_START_FLAG_SET_INIT_VALUE | \
+		SBI_PMU_START_FLAG_INIT_FROM_SNAPSHOT \
+	)
 
 /* Flags defined for counter stop function */
 #define SBI_PMU_STOP_FLAG_RESET (1 << 0)
 #define SBI_PMU_STOP_FLAG_TAKE_SNAPSHOT (1 << 1)
+/* Stop flags valid mask */
+#define SBI_PMU_STOP_FLAGS_MASK	\
+	( \
+		SBI_PMU_STOP_FLAG_RESET | \
+		SBI_PMU_STOP_FLAG_TAKE_SNAPSHOT \
+	)
 
 /* SBI function IDs for DBCN extension */
 #define SBI_EXT_DBCN_CONSOLE_WRITE		0x0
@@ -468,6 +482,15 @@ enum sbi_sse_state {
 #define SBI_EXT_MPXY_SEND_MSG_WITH_RESP		0x5
 #define SBI_EXT_MPXY_SEND_MSG_WITHOUT_RESP	0x6
 #define SBI_EXT_MPXY_GET_NOTIFICATION_EVENTS	0x7
+
+/** SBI MPXY notification header size */
+#define SBI_MPXY_NOTIF_HDR_SIZE			16
+
+/** SBI MPXY notification header offsets */
+#define SBI_MPXY_NOTIF_HDR_REMAINING_OFFSET	0x00
+#define SBI_MPXY_NOTIF_HDR_RETURNED_OFFSET	0x04
+#define SBI_MPXY_NOTIF_HDR_LOST_OFFSET		0x08
+#define SBI_MPXY_NOTIF_HDR_RESERVED_OFFSET	0x0C
 
 /* SBI base specification related macros */
 #define SBI_SPEC_VERSION_MAJOR_OFFSET		24

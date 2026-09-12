@@ -36,6 +36,7 @@ struct aplic_data {
 	struct sbi_dlist node;
 	/* Public members */
 	u32 unique_id;
+	u32 parent_unique_id;
 	unsigned long addr;
 	unsigned long size;
 	unsigned long num_idc;

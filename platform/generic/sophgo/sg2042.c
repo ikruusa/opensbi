@@ -31,31 +31,33 @@ static int sophgo_sg2042_early_init(bool cold_boot)
 
 	thead_register_tlb_flush_trap_handler();
 
-	/*
-	 * Sophgo sg2042 soc use separate 16 timers while initiating,
-	 * merge them as a single domain to avoid wasting.
-	 */
-	if (cold_boot)
-		return sbi_domain_root_add_memrange(
-					(ulong)SOPHGO_SG2042_TIMER_BASE,
-					SOPHGO_SG2042_TIMER_SIZE *
-					SOPHGO_SG2042_TIMER_NUM,
-					MTIMER_REGION_ALIGN,
-					(SBI_DOMAIN_MEMREGION_MMIO |
-					 SBI_DOMAIN_MEMREGION_M_READABLE |
-					 SBI_DOMAIN_MEMREGION_M_WRITABLE));
-
-
 	return 0;
 }
 
-static int sophgo_sg2042_extensions_init(struct sbi_hart_features *hfeatures)
+static int sophgo_sg2042_extensions_init(bool cold_boot)
 {
 	int rc;
 
-	rc = generic_extensions_init(hfeatures);
+	rc = generic_extensions_init(cold_boot);
 	if (rc)
 		return rc;
+
+	/*
+	 * SG2042 has 16 separate timers. Add one combined region before the
+	 * MTIMER driver adds the individual regions.
+	 */
+	if (cold_boot) {
+		rc = sbi_domain_root_add_memrange(
+				(ulong)SOPHGO_SG2042_TIMER_BASE,
+				SOPHGO_SG2042_TIMER_SIZE *
+				SOPHGO_SG2042_TIMER_NUM,
+				MTIMER_REGION_ALIGN,
+				(SBI_DOMAIN_MEMREGION_MMIO |
+				 SBI_DOMAIN_MEMREGION_M_READABLE |
+				 SBI_DOMAIN_MEMREGION_M_WRITABLE));
+		if (rc)
+			return rc;
+	}
 
 	thead_c9xx_register_pmu_device();
 	return 0;

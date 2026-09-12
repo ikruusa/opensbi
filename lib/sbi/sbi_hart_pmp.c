@@ -12,8 +12,118 @@
 #include <sbi/sbi_hfence.h>
 #include <sbi/sbi_math.h>
 #include <sbi/sbi_platform.h>
+#include <sbi/sbi_pmp.h>
 #include <sbi/sbi_tlb.h>
 #include <sbi/riscv_asm.h>
+
+static int hart_pmp_read(pmp_t *pmp, unsigned int n)
+{
+	int pmpcfg_csr, pmpcfg_shift, pmpaddr_csr;
+	unsigned long cfgmask;
+
+	/* check parameters */
+	if (n >= PMP_COUNT)
+		return SBI_EINVAL;
+
+	/* calculate PMP register and offset */
+#if __riscv_xlen == 32
+	pmpcfg_csr   = CSR_PMPCFG0 + (n >> 2);
+	pmpcfg_shift = (n & 3) << 3;
+#elif __riscv_xlen == 64
+	pmpcfg_csr   = (CSR_PMPCFG0 + (n >> 2)) & ~1;
+	pmpcfg_shift = (n & 7) << 3;
+#else
+# error "Unexpected __riscv_xlen"
+#endif
+	pmpaddr_csr = CSR_PMPADDR0 + n;
+
+	cfgmask = (0xffUL << pmpcfg_shift);
+	pmp->cfg = (csr_read_num(pmpcfg_csr) & cfgmask) >> pmpcfg_shift;
+	pmp->addr = csr_read_num(pmpaddr_csr);
+
+	return SBI_OK;
+}
+
+static int hart_pmp_write(pmp_t *pmp, unsigned int n)
+{
+	int pmpcfg_csr, pmpcfg_shift, pmpaddr_csr;
+	unsigned long cfgmask, pmpcfg;
+
+	/* check parameters */
+	if (n >= PMP_COUNT)
+		return SBI_EINVAL;
+
+	/* calculate PMP register and offset */
+#if __riscv_xlen == 32
+	pmpcfg_csr   = CSR_PMPCFG0 + (n >> 2);
+	pmpcfg_shift = (n & 3) << 3;
+#elif __riscv_xlen == 64
+	pmpcfg_csr   = (CSR_PMPCFG0 + (n >> 2)) & ~1;
+	pmpcfg_shift = (n & 7) << 3;
+#else
+# error "Unexpected __riscv_xlen"
+#endif
+	pmpaddr_csr = CSR_PMPADDR0 + n;
+
+	/* write csrs */
+	csr_write_num(pmpaddr_csr, pmp->addr);
+	cfgmask = ~(0xffUL << pmpcfg_shift);
+	pmpcfg  = (csr_read_num(pmpcfg_csr) & cfgmask);
+	pmpcfg |= (((unsigned long)pmp->cfg << pmpcfg_shift) & ~cfgmask);
+	csr_write_num(pmpcfg_csr, pmpcfg);
+
+	return SBI_OK;
+}
+
+int sbi_hart_pmp_disable(unsigned int n)
+{
+	pmp_t pmp;
+	int rc;
+
+	rc = hart_pmp_read(&pmp, n);
+	if (rc)
+		return rc;
+
+	pmp.cfg = 0;
+
+	return hart_pmp_write(&pmp, n);
+}
+
+bool sbi_hart_is_pmp_enabled(unsigned int n)
+{
+	pmp_t pmp;
+
+	if (hart_pmp_read(&pmp, n) != SBI_OK)
+		return false;
+
+	return sbi_pmp_is_enabled(&pmp);
+}
+
+int sbi_hart_pmp_set(unsigned int n, unsigned long prot, unsigned long addr,
+		     unsigned long log2len)
+{
+	pmp_t pmp;
+	int rc;
+
+	rc = sbi_pmp_encode(&pmp, prot, addr, log2len);
+	if (rc)
+		return rc;
+
+	return hart_pmp_write(&pmp, n);
+}
+
+int sbi_hart_pmp_get(unsigned int n, unsigned long *prot_out, unsigned long *addr_out,
+		     unsigned long *log2len)
+{
+	pmp_t pmp;
+	int rc;
+
+	rc = hart_pmp_read(&pmp, n);
+	if (rc)
+		return rc;
+
+	return sbi_pmp_decode(&pmp, prot_out, addr_out, log2len);
+}
 
 /*
  * Smepmp enforces access boundaries between M-mode and
@@ -25,7 +135,7 @@
  * When shared memory access is required, the physical address
  * should be programmed into the first PMP entry with R/W
  * permissions to the M-mode. Once the work is done, it should be
- * unmapped. sbi_hart_protection_map_range/sbi_hart_protection_unmap_range
+ * unmapped. sbi_hart_protection_temp_map_range/sbi_hart_protection_temp_unmap_range
  * function pair should be used to map/unmap the shared memory.
  */
 #define SBI_SMEPMP_RESV_ENTRY		0
@@ -100,7 +210,7 @@ static void sbi_hart_smepmp_set(struct sbi_scratch *scratch,
 		sbi_platform_pmp_set(sbi_platform_ptr(scratch),
 				     pmp_idx, reg->flags, pmp_flags,
 				     reg->base, reg->order);
-		pmp_set(pmp_idx, pmp_flags, reg->base, reg->order);
+		sbi_hart_pmp_set(pmp_idx, pmp_flags, reg->base, reg->order);
 	} else {
 		sbi_printf("Can not configure pmp for domain %s because"
 			   " memory region address 0x%lx or size 0x%lx "
@@ -118,10 +228,10 @@ static bool is_valid_pmp_idx(unsigned int pmp_count, unsigned int pmp_idx)
 	return false;
 }
 
-static int sbi_hart_smepmp_configure(struct sbi_scratch *scratch)
+static int sbi_hart_smepmp_configure(struct sbi_scratch *scratch,
+				     struct sbi_domain *dom)
 {
 	struct sbi_domain_memregion *reg;
-	struct sbi_domain *dom = sbi_domain_thishart_ptr();
 	unsigned int pmp_log2gran, pmp_bits;
 	unsigned int pmp_idx, pmp_count;
 	unsigned long pmp_addr_max;
@@ -139,7 +249,7 @@ static int sbi_hart_smepmp_configure(struct sbi_scratch *scratch)
 	csr_set(CSR_MSECCFG, MSECCFG_RLB);
 
 	/* Disable the reserved entry */
-	pmp_disable(SBI_SMEPMP_RESV_ENTRY);
+	sbi_hart_pmp_disable(SBI_SMEPMP_RESV_ENTRY);
 
 	/* Program M-only regions when MML is not set. */
 	pmp_idx = 0;
@@ -206,7 +316,7 @@ static int sbi_hart_smepmp_configure(struct sbi_scratch *scratch)
 	}
 	/* Disable remaining PMP entries */
 	for(; pmp_idx < pmp_count; pmp_idx++)
-		pmp_disable(pmp_idx);
+		sbi_hart_pmp_disable(pmp_idx);
 
 	/*
 	 * All entries are programmed.
@@ -217,14 +327,14 @@ static int sbi_hart_smepmp_configure(struct sbi_scratch *scratch)
 	return 0;
 }
 
-static int sbi_hart_smepmp_map_range(struct sbi_scratch *scratch,
+static int sbi_hart_smepmp_temp_map_range(struct sbi_scratch *scratch,
 				     unsigned long addr, unsigned long size)
 {
 	/* shared R/W access for M and S/U mode */
 	unsigned int pmp_flags = (PMP_W | PMP_X);
 	unsigned long order, base = 0;
 
-	if (is_pmp_entry_mapped(SBI_SMEPMP_RESV_ENTRY))
+	if (sbi_hart_is_pmp_enabled(SBI_SMEPMP_RESV_ENTRY))
 		return SBI_ENOSPC;
 
 	for (order = MAX(sbi_hart_pmp_log2gran(scratch), log2roundup(size));
@@ -244,22 +354,22 @@ static int sbi_hart_smepmp_map_range(struct sbi_scratch *scratch,
 	sbi_platform_pmp_set(sbi_platform_ptr(scratch), SBI_SMEPMP_RESV_ENTRY,
 			     SBI_DOMAIN_MEMREGION_SHARED_SURW_MRW,
 			     pmp_flags, base, order);
-	pmp_set(SBI_SMEPMP_RESV_ENTRY, pmp_flags, base, order);
+	sbi_hart_pmp_set(SBI_SMEPMP_RESV_ENTRY, pmp_flags, base, order);
 
 	return SBI_OK;
 }
 
-static int sbi_hart_smepmp_unmap_range(struct sbi_scratch *scratch,
+static int sbi_hart_smepmp_temp_unmap_range(struct sbi_scratch *scratch,
 				       unsigned long addr, unsigned long size)
 {
 	sbi_platform_pmp_disable(sbi_platform_ptr(scratch), SBI_SMEPMP_RESV_ENTRY);
-	return pmp_disable(SBI_SMEPMP_RESV_ENTRY);
+	return sbi_hart_pmp_disable(SBI_SMEPMP_RESV_ENTRY);
 }
 
-static int sbi_hart_oldpmp_configure(struct sbi_scratch *scratch)
+static int sbi_hart_oldpmp_configure(struct sbi_scratch *scratch,
+				     struct sbi_domain *dom)
 {
 	struct sbi_domain_memregion *reg;
-	struct sbi_domain *dom = sbi_domain_thishart_ptr();
 	unsigned long pmp_addr, pmp_addr_max;
 	unsigned int pmp_log2gran, pmp_bits;
 	unsigned int pmp_idx, pmp_count;
@@ -281,7 +391,7 @@ static int sbi_hart_oldpmp_configure(struct sbi_scratch *scratch)
 			sbi_platform_pmp_set(sbi_platform_ptr(scratch),
 					     pmp_idx, reg->flags, pmp_flags,
 					     reg->base, reg->order);
-			pmp_set(pmp_idx++, pmp_flags, reg->base, reg->order);
+			sbi_hart_pmp_set(pmp_idx++, pmp_flags, reg->base, reg->order);
 		} else {
 			sbi_printf("Can not configure pmp for domain %s because"
 				   " memory region address 0x%lx or size 0x%lx "
@@ -291,13 +401,14 @@ static int sbi_hart_oldpmp_configure(struct sbi_scratch *scratch)
 	}
 	/* Disable remaining PMP entries */
 	for(; pmp_idx < pmp_count; pmp_idx++)
-		pmp_disable(pmp_idx);
+		sbi_hart_pmp_disable(pmp_idx);
 
 	sbi_hart_pmp_fence();
 	return 0;
 }
 
-static void sbi_hart_pmp_unconfigure(struct sbi_scratch *scratch)
+static void sbi_hart_pmp_unconfigure(struct sbi_scratch *scratch,
+				     struct sbi_domain *dom)
 {
 	int i, pmp_count = sbi_hart_pmp_count(scratch);
 
@@ -307,13 +418,14 @@ static void sbi_hart_pmp_unconfigure(struct sbi_scratch *scratch)
 			continue;
 
 		sbi_platform_pmp_disable(sbi_platform_ptr(scratch), i);
-		pmp_disable(i);
+		sbi_hart_pmp_disable(i);
 	}
 }
 
 static struct sbi_hart_protection pmp_protection = {
 	.name = "pmp",
 	.rating = 100,
+	.type = SBI_HART_PROTECTION_TYPE_MEMORY,
 	.configure = sbi_hart_oldpmp_configure,
 	.unconfigure = sbi_hart_pmp_unconfigure,
 };
@@ -321,10 +433,11 @@ static struct sbi_hart_protection pmp_protection = {
 static struct sbi_hart_protection epmp_protection = {
 	.name = "epmp",
 	.rating = 200,
+	.type = SBI_HART_PROTECTION_TYPE_MEMORY,
 	.configure = sbi_hart_smepmp_configure,
 	.unconfigure = sbi_hart_pmp_unconfigure,
-	.map_range = sbi_hart_smepmp_map_range,
-	.unmap_range = sbi_hart_smepmp_unmap_range,
+	.temp_map_range = sbi_hart_smepmp_temp_map_range,
+	.temp_unmap_range = sbi_hart_smepmp_temp_unmap_range,
 };
 
 int sbi_hart_pmp_init(struct sbi_scratch *scratch)

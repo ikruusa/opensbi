@@ -20,8 +20,16 @@ struct sbi_irqchip_hwirq_data {
 	/** raw hardware interrupt handler */
 	int (*raw_handler)(struct sbi_irqchip_device *chip, u32 hwirq);
 
+#define IRQ_ENABLED	BIT(0)
+	/** interrupt state
+	 * bit 0 - 1: enabled, 0: disabled */
+	u32 irq_state;
+
 	/** target hart index */
 	u32 hart_index;
+
+	/** chip's private data */
+	void *priv;
 };
 
 /** Internal irqchip interrupt handler */
@@ -77,23 +85,54 @@ int sbi_irqchip_process_hwirq(struct sbi_irqchip_device *chip, u32 hwirq)
 	return data->raw_handler(chip, hwirq);
 }
 
+static inline u32 sbi_irqchip_get_irq_state(struct sbi_irqchip_device *chip,
+					     u32 hwirq)
+{
+	if (!chip || !chip->hwirqs || hwirq >= chip->num_hwirq)
+		return 0;
+
+	return chip->hwirqs[hwirq].irq_state;
+}
+
+bool sbi_irqchip_is_hwirq_enabled(struct sbi_irqchip_device *chip,
+				   u32 hwirq)
+{
+	return !!(sbi_irqchip_get_irq_state(chip, hwirq) & IRQ_ENABLED);
+}
+
 int sbi_irqchip_unmask_hwirq(struct sbi_irqchip_device *chip, u32 hwirq)
 {
+	struct sbi_irqchip_hwirq_data *data;
+
 	if (!chip || chip->num_hwirq <= hwirq)
 		return SBI_EINVAL;
 
+	data = &chip->hwirqs[hwirq];
+	if (sbi_irqchip_is_hwirq_enabled(chip, hwirq))
+		return SBI_EALREADY;
+
 	if (chip->hwirq_unmask)
 		chip->hwirq_unmask(chip, hwirq);
+
+	data->irq_state |= IRQ_ENABLED;
 	return 0;
 }
 
 int sbi_irqchip_mask_hwirq(struct sbi_irqchip_device *chip, u32 hwirq)
 {
+	struct sbi_irqchip_hwirq_data *data;
+
 	if (!chip || chip->num_hwirq <= hwirq)
 		return SBI_EINVAL;
 
+	if (!sbi_irqchip_is_hwirq_enabled(chip, hwirq))
+		return SBI_EALREADY;
+
 	if (chip->hwirq_mask)
 		chip->hwirq_mask(chip, hwirq);
+
+	data = &chip->hwirqs[hwirq];
+	data->irq_state &= ~IRQ_ENABLED;
 	return 0;
 }
 
@@ -113,6 +152,30 @@ static struct sbi_irqchip_handler *sbi_irqchip_find_handler(struct sbi_irqchip_d
 	return NULL;
 }
 
+int sbi_irqchip_set_hwirq_priv(struct sbi_irqchip_device *chip, u32 hwirq, void *priv)
+{
+	struct sbi_irqchip_hwirq_data *data;
+
+	if (!chip || chip->num_hwirq <= hwirq)
+	     return SBI_EINVAL;
+
+	data = &chip->hwirqs[hwirq];
+	data->priv = priv;
+
+	return 0;
+}
+
+void *sbi_irqchip_get_hwirq_priv(struct sbi_irqchip_device *chip, u32 hwirq)
+{
+	struct sbi_irqchip_hwirq_data *data;
+	if (!chip || chip->num_hwirq <= hwirq)
+	    return NULL;
+
+	data = &chip->hwirqs[hwirq];
+
+	return data->priv;
+}
+
 int sbi_irqchip_raw_handler_default(struct sbi_irqchip_device *chip, u32 hwirq)
 {
 	struct sbi_irqchip_handler *h;
@@ -122,6 +185,9 @@ int sbi_irqchip_raw_handler_default(struct sbi_irqchip_device *chip, u32 hwirq)
 		return SBI_EINVAL;
 
 	h = sbi_irqchip_find_handler(chip, hwirq);
+	if (!h)
+		return SBI_EINVAL;
+
 	if (h->callback)
 		rc = h->callback(hwirq, h->priv);
 
@@ -329,7 +395,7 @@ int sbi_irqchip_register_msi(struct sbi_irqchip_device *chip, u32 num_hwirq,
 		if (h->first_hwirq <= hwirq && hwirq < (h->first_hwirq + h->num_hwirq)) {
 			hwirq = h->first_hwirq + h->num_hwirq;
 		} else if (hwirq < h->first_hwirq) {
-			if (h->first_hwirq - hwirq < num_hwirq) {
+			if (h->first_hwirq - hwirq >= num_hwirq) {
 				found = true;
 				break;
 			} else {
@@ -337,7 +403,7 @@ int sbi_irqchip_register_msi(struct sbi_irqchip_device *chip, u32 num_hwirq,
 			}
 		}
 	}
-	if (!found && !hwirq)
+	if (!found && (chip->num_hwirq - hwirq) >= num_hwirq)
 		found = true;
 	if (!found)
 		return SBI_ENOSPC;
@@ -406,6 +472,25 @@ int sbi_irqchip_unregister_handler(struct sbi_irqchip_device *chip,
 
 	sbi_list_del(&fh->node);
 	return 0;
+}
+
+struct sbi_irqchip_device *sbi_irqchip_find_device_by_caps(unsigned long caps,
+							   struct sbi_irqchip_device *first)
+{
+	struct sbi_irqchip_device *chip;
+	bool found = (first == NULL);
+
+	sbi_list_for_each_entry(chip, &irqchip_list, node) {
+		if (!found) {
+			if (first == chip)
+				found = true;
+			continue;
+		}
+		if ((chip->caps & caps) == caps)
+			return chip;
+	}
+
+	return NULL;
 }
 
 struct sbi_irqchip_device *sbi_irqchip_find_device(u32 id)

@@ -64,14 +64,14 @@ struct hart_context {
 	bool initialized;
 };
 
-static struct sbi_domain_data dcpriv;
+static struct sbi_domain_state dcstate;
 
 static inline struct hart_context *hart_context_get(struct sbi_domain *dom,
 						    u32 hartindex)
 {
 	struct hart_context **dom_hartindex_to_context_table;
 
-	dom_hartindex_to_context_table = sbi_domain_data_ptr(dom, &dcpriv);
+	dom_hartindex_to_context_table = sbi_domain_state_ptr(dom, &dcstate);
 	if (!dom_hartindex_to_context_table || !sbi_hartindex_valid(hartindex))
 		return NULL;
 
@@ -83,7 +83,7 @@ static void hart_context_set(struct sbi_domain *dom, u32 hartindex,
 {
 	struct hart_context **dom_hartindex_to_context_table;
 
-	dom_hartindex_to_context_table = sbi_domain_data_ptr(dom, &dcpriv);
+	dom_hartindex_to_context_table = sbi_domain_state_ptr(dom, &dcstate);
 	if (!dom_hartindex_to_context_table || !sbi_hartindex_valid(hartindex))
 		return;
 
@@ -129,10 +129,6 @@ static int switch_to_next_domain_context(struct hart_context *ctx,
 	sbi_hartmask_set_hartindex(hartindex, &target_dom->assigned_harts);
 	spin_unlock(&target_dom->assigned_harts_lock);
 
-	/* Reconfigure PMP settings for the new domain */
-	sbi_hart_protection_unconfigure(scratch);
-	sbi_hart_protection_configure(scratch);
-
 	/* Save current CSR context and restore target domain's CSR context */
 	ctx->sstatus	= csr_swap(CSR_SSTATUS, dom_ctx->sstatus);
 	ctx->sie	= csr_swap(CSR_SIE, dom_ctx->sie);
@@ -167,6 +163,15 @@ static int switch_to_next_domain_context(struct hart_context *ctx,
 	trap_ctx = sbi_trap_get_context(scratch);
 	sbi_memcpy(&ctx->trap_ctx, trap_ctx, sizeof(*trap_ctx));
 	sbi_memcpy(trap_ctx, &dom_ctx->trap_ctx, sizeof(*trap_ctx));
+
+	/*
+	 * Re-configure PMP settings for the new domain
+	 *
+	 * This will internally perform full SFENCE / HFENCE which
+	 * is also required for some of the above CSR updates (such
+	 * as satp CSR).
+	 */
+	sbi_hart_protection_reconfigure(scratch, current_dom, target_dom);
 
 	/* Mark current context structure initialized because context saved */
 	ctx->initialized = true;
@@ -309,15 +314,15 @@ int sbi_domain_context_init(void)
 	/**
 	 * Allocate per-domain and per-hart context data.
 	 * The data type is "struct hart_context **" whose memory space will be
-	 * dynamically allocated by domain_setup_data_one(). Calculate needed
+	 * dynamically allocated by domain_setup_state_one(). Calculate needed
 	 * size of memory space here.
 	 */
-	dcpriv.data_size = sizeof(struct hart_context *) * sbi_hart_count();
+	dcstate.state_size = sizeof(struct hart_context *) * sbi_hart_count();
 
-	return sbi_domain_register_data(&dcpriv);
+	return sbi_domain_register_state(&dcstate);
 }
 
 void sbi_domain_context_deinit(void)
 {
-	sbi_domain_unregister_data(&dcpriv);
+	sbi_domain_unregister_state(&dcstate);
 }

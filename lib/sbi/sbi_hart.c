@@ -211,48 +211,6 @@ static int fp_init(struct sbi_scratch *scratch)
 	return 0;
 }
 
-static int delegate_traps(struct sbi_scratch *scratch)
-{
-	const struct sbi_platform *plat = sbi_platform_ptr(scratch);
-	unsigned long interrupts, exceptions;
-
-	if (!misa_extension('S'))
-		/* No delegation possible as mideleg does not exist */
-		return 0;
-
-	/* Send M-mode interrupts and most exceptions to S-mode */
-	interrupts = MIP_SSIP | MIP_STIP | MIP_SEIP;
-	interrupts |= sbi_pmu_irq_mask();
-
-	exceptions = (1U << CAUSE_MISALIGNED_FETCH) | (1U << CAUSE_BREAKPOINT) |
-		     (1U << CAUSE_USER_ECALL);
-	if (sbi_platform_has_mfaults_delegation(plat))
-		exceptions |= (1U << CAUSE_FETCH_PAGE_FAULT) |
-			      (1U << CAUSE_LOAD_PAGE_FAULT) |
-			      (1U << CAUSE_STORE_PAGE_FAULT) |
-			      (1U << CAUSE_SW_CHECK_EXCP);
-
-	/*
-	 * If hypervisor extension available then we only handle hypervisor
-	 * calls (i.e. ecalls from HS-mode) in M-mode.
-	 *
-	 * The HS-mode will additionally handle supervisor calls (i.e. ecalls
-	 * from VS-mode), Guest page faults and Virtual interrupts.
-	 */
-	if (misa_extension('H')) {
-		exceptions |= (1U << CAUSE_VIRTUAL_SUPERVISOR_ECALL);
-		exceptions |= (1U << CAUSE_FETCH_GUEST_PAGE_FAULT);
-		exceptions |= (1U << CAUSE_LOAD_GUEST_PAGE_FAULT);
-		exceptions |= (1U << CAUSE_VIRTUAL_INST_FAULT);
-		exceptions |= (1U << CAUSE_STORE_GUEST_PAGE_FAULT);
-	}
-
-	csr_write(CSR_MIDELEG, interrupts);
-	csr_write(CSR_MEDELEG, exceptions);
-
-	return 0;
-}
-
 void sbi_hart_delegation_dump(struct sbi_scratch *scratch,
 			      const char *prefix, const char *suffix)
 {
@@ -508,7 +466,7 @@ static int hart_mhpm_get_allowed_bits(void)
 	return num_bits;
 }
 
-static int hart_detect_features(struct sbi_scratch *scratch)
+static int hart_detect_features(struct sbi_scratch *scratch, bool cold_boot)
 {
 	struct sbi_trap_info trap = {0};
 	struct sbi_hart_features *hfeatures =
@@ -520,20 +478,12 @@ static int hart_detect_features(struct sbi_scratch *scratch)
 	if (hfeatures->detected)
 		return 0;
 
-	/* Clear hart features */
-	sbi_memset(hfeatures->extensions, 0, sizeof(hfeatures->extensions));
-	sbi_memset(hfeatures->csrs, 0, sizeof(hfeatures->csrs));
-	hfeatures->pmp_count = 0;
-	hfeatures->mhpm_mask = 0;
-	hfeatures->priv_version = SBI_HART_PRIV_VER_UNKNOWN;
-
 	/*
 	 * Parse device tree extensions early, before any trap-based checks.
 	 * Needed to detect Smrnmi and install NMI handlers before CSR probes
 	 * that may trigger traps.
 	 */
-	rc = sbi_platform_extensions_init(sbi_platform_thishart_ptr(),
-					  hfeatures);
+	rc = sbi_platform_extensions_init(sbi_platform_ptr(scratch), cold_boot);
 	if (rc)
 		return rc;
 
@@ -771,7 +721,7 @@ int sbi_hart_init(struct sbi_scratch *scratch, bool cold_boot)
 			return SBI_ENOMEM;
 	}
 
-	rc = hart_detect_features(scratch);
+	rc = hart_detect_features(scratch, cold_boot);
 	if (rc)
 		return rc;
 
@@ -780,10 +730,6 @@ int sbi_hart_init(struct sbi_scratch *scratch, bool cold_boot)
 		if (rc)
 			return rc;
 	}
-
-	rc = delegate_traps(scratch);
-	if (rc)
-		return rc;
 
 	return sbi_hart_reinit(scratch);
 }

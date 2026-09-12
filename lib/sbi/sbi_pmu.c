@@ -223,8 +223,16 @@ static int pmu_ctr_validate(struct sbi_pmu_hart_state *phs,
 
 static bool pmu_ctr_idx_validate(unsigned long cbase, unsigned long cmask)
 {
-	/* Do a basic sanity check of counter base & mask */
-	return cmask && cbase + sbi_fls(cmask) < total_ctrs;
+	unsigned long last;
+
+	if (!cmask)
+		return false;
+
+	last = sbi_fls(cmask);
+	if (cbase > -1UL - last)
+		return false;
+
+	return (cbase + last) < total_ctrs;
 }
 
 int sbi_pmu_ctr_fw_read(unsigned long cidx, uint64_t *cval, bool high_bits)
@@ -566,6 +574,9 @@ int sbi_pmu_ctr_start(unsigned long cbase, unsigned long cmask,
 	if (!pmu_ctr_idx_validate(cbase, cmask))
 		return ret;
 
+	if (flags & ~SBI_PMU_START_FLAGS_MASK)
+		return SBI_ERR_INVALID_PARAM;
+
 	if (flags & SBI_PMU_STOP_FLAG_TAKE_SNAPSHOT)
 		return SBI_ENO_SHMEM;
 
@@ -584,6 +595,8 @@ int sbi_pmu_ctr_start(unsigned long cbase, unsigned long cmask,
 				 : 0x0;
 			ret = pmu_ctr_start_fw(phs, cidx, event_code, edata,
 					       ival, bUpdate);
+			if (ret)
+				return ret;
 		} else {
 			if (cidx >= 3) {
 				struct sbi_pmu_hw_event_config *ev_cfg =
@@ -597,6 +610,8 @@ int sbi_pmu_ctr_start(unsigned long cbase, unsigned long cmask,
 					return ret;
 			}
 			ret = pmu_ctr_start_hw(cidx, ival, bUpdate);
+			if (ret)
+				return ret;
 		}
 	}
 
@@ -685,6 +700,9 @@ int sbi_pmu_ctr_stop(unsigned long cbase, unsigned long cmask,
 	if (!pmu_ctr_idx_validate(cbase, cmask))
 		return ret;
 
+	if (flag & ~SBI_PMU_STOP_FLAGS_MASK)
+		return SBI_ERR_INVALID_PARAM;
+
 	if (flag & SBI_PMU_STOP_FLAG_TAKE_SNAPSHOT)
 		return SBI_ENO_SHMEM;
 
@@ -699,6 +717,9 @@ int sbi_pmu_ctr_stop(unsigned long cbase, unsigned long cmask,
 			ret = pmu_ctr_stop_fw(phs, cidx, event_code);
 		else
 			ret = pmu_ctr_stop_hw(cidx);
+
+		if(ret)
+			return ret;
 
 		if (cidx > (CSR_INSTRET - CSR_CYCLE) && flag & SBI_PMU_STOP_FLAG_RESET) {
 			phs->active_events[cidx] = SBI_PMU_EVENT_IDX_INVALID;
@@ -915,6 +936,9 @@ int sbi_pmu_ctr_cfg_match(unsigned long cidx_base, unsigned long cidx_mask,
 		 */
 		unsigned long cidx_first = cidx_base + sbi_ffs(cidx_mask);
 
+		if (cidx_first >= total_ctrs)
+			return SBI_EINVAL;
+
 		if (phs->active_events[cidx_first] == SBI_PMU_EVENT_IDX_INVALID)
 			return SBI_EINVAL;
 		ctr_idx = cidx_first;
@@ -946,7 +970,10 @@ int sbi_pmu_ctr_cfg_match(unsigned long cidx_base, unsigned long cidx_mask,
 
 	phs->active_events[ctr_idx] = event_idx;
 skip_match:
-	if (event_type == SBI_PMU_EVENT_TYPE_HW) {
+	if (event_type == SBI_PMU_EVENT_TYPE_HW ||
+	    event_type == SBI_PMU_EVENT_TYPE_HW_CACHE ||
+	    event_type == SBI_PMU_EVENT_TYPE_HW_RAW ||
+	    event_type == SBI_PMU_EVENT_TYPE_HW_RAW_V2) {
 		if (flags & SBI_PMU_CFG_FLAG_CLEAR_VALUE)
 			pmu_ctr_write_hw(ctr_idx, 0);
 		if (flags & SBI_PMU_CFG_FLAG_AUTO_START)
@@ -1079,20 +1106,34 @@ int sbi_pmu_event_get_info(unsigned long shmem_phys_lo, unsigned long shmem_phys
 					 SBI_DOMAIN_READ | SBI_DOMAIN_WRITE))
 		return SBI_ERR_INVALID_ADDRESS;
 
-	sbi_hart_protection_map_range(shmem_phys_lo, shmem_size);
+	sbi_hart_protection_temp_map_range(shmem_phys_lo, shmem_size);
 
 	einfo = (struct sbi_pmu_event_info *)(shmem_phys_lo);
 	for (i = 0; i < num_events; i++) {
 		event_idx = einfo[i].event_idx;
+		/* Any must-be-zero event_idx bits set should return INVALID_PARAM per-spec */
+		if (event_idx & SBI_PMU_EVENT_IDX_MBZ_MASK)
+			return SBI_ERR_INVALID_PARAM;
 		event_type = pmu_event_validate(phs, event_idx, einfo[i].event_data);
 		if (event_type < 0) {
 			einfo[i].output = 0;
+		} else if (event_type == SBI_PMU_EVENT_TYPE_FW) {
+			einfo[i].output = 1;
 		} else {
 			for (j = 0; j < num_hw_events; j++) {
 				temp = &hw_event_map[j];
 				/* For raw events, event data is used as the select value */
 				if (event_idx == SBI_PMU_EVENT_RAW_IDX ||
 					event_idx == SBI_PMU_EVENT_RAW_V2_IDX) {
+					/*
+					 * Only a raw event map entry carries a
+					 * meaningful select/select_mask pair, so
+					 * skip any entry which does not cover the
+					 * raw event index.
+					 */
+					if (temp->start_idx > event_idx ||
+					    event_idx > temp->end_idx)
+						continue;
 					/* just match the selector */
 					if (temp->select == (einfo[i].event_data &
 									temp->select_mask)) {
@@ -1113,7 +1154,7 @@ int sbi_pmu_event_get_info(unsigned long shmem_phys_lo, unsigned long shmem_phys
 		}
 	}
 
-	sbi_hart_protection_unmap_range(shmem_phys_lo, shmem_size);
+	sbi_hart_protection_temp_unmap_range(shmem_phys_lo, shmem_size);
 
 	return 0;
 }

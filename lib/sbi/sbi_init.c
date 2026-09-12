@@ -76,7 +76,6 @@ static void sbi_boot_print_general(struct sbi_scratch *scratch)
 	const struct sbi_hsm_device *hdev;
 	const struct sbi_ipi_device *idev;
 	const struct sbi_timer_device *tdev;
-	const struct sbi_hart_protection *hprot;
 	const struct sbi_console_device *cdev;
 	const struct sbi_system_reset_device *srdev;
 	const struct sbi_system_suspend_device *susp_dev;
@@ -93,9 +92,8 @@ static void sbi_boot_print_general(struct sbi_scratch *scratch)
 	sbi_printf("Platform Features           : %s\n", str);
 	sbi_printf("Platform HART Count         : %u\n",
 		   sbi_platform_hart_count(plat));
-	hprot = sbi_hart_protection_best();
-	sbi_printf("Platform HART Protection    : %s\n",
-		   (hprot) ? hprot->name : "---");
+	sbi_hart_protection_get_str(str, sizeof(str));
+	sbi_printf("Platform HART Protection    : %s\n", str);
 	idev = sbi_ipi_get_device();
 	sbi_printf("Platform IPI Device         : %s\n",
 		   (idev) ? idev->name : "---");
@@ -218,7 +216,7 @@ static void wake_coldboot_harts(struct sbi_scratch *scratch)
 	__smp_store_release(&coldboot_done, 1);
 }
 
-unsigned long __stack_chk_guard = 0x95B5FF5A;
+unsigned long __attribute__((weak)) __stack_chk_guard = 0x95B5FF5A;
 
 static unsigned long entry_count_offset;
 static unsigned long init_count_offset;
@@ -280,25 +278,38 @@ static void __noreturn init_coldboot(struct sbi_scratch *scratch, u32 hartid)
 	if (sbi_hart_has_extension(scratch, SBI_HART_EXT_ZKR)) {
 		unsigned long guard_val = 0;
 		int chunks = sizeof(unsigned long) / sizeof(uint16_t);
-		bool res = true;
+#ifndef CONFIG_ZKR_POLL_BUDGET
+#define CONFIG_ZKR_POLL_BUDGET		1000
+#endif
+		unsigned int tries = CONFIG_ZKR_POLL_BUDGET;
+		bool res = false;
 
-		while (chunks) {
+		while (chunks && tries) {
 			unsigned long seed = csr_swap(CSR_SEED, 0);
 			unsigned long opst = seed & SEED_OPTS_MASK;
+			res = false;
 
 			if (opst == SEED_OPTS_DEAD) {
-				res = false;
 				break;
 			}
 			if (opst == SEED_OPTS_ES16) {
 				guard_val = (guard_val << 16) | (seed & SEED_ENTROPY_MASK);
 				chunks--;
+				res = true;
+				/* Successful read doesn't consume a try */
+				tries++;
 			}
+
+			tries--;
 			continue;
 		}
 		if (res)
 			__stack_chk_guard = guard_val;
 	}
+
+	rc = sbi_trap_init(scratch, true);
+	if (rc)
+		sbi_hart_hang();
 
 	rc = sbi_timer_init(scratch, true);
 	if (rc)
@@ -419,12 +430,12 @@ static void __noreturn init_coldboot(struct sbi_scratch *scratch, u32 hartid)
 	}
 
 	/*
-	 * Configure hart isolation at last because if SMEPMP is,
+	 * Configure hart protection at last because if SMEPMP is
 	 * detected, M-mode access to the S/U space will be rescinded.
 	 */
-	rc = sbi_hart_protection_configure(scratch);
+	rc = sbi_hart_protection_configure(scratch, sbi_domain_thishart_ptr());
 	if (rc) {
-		sbi_printf("%s: hart isolation configure failed (error %d)\n",
+		sbi_printf("%s: hart protection configure failed (error %d)\n",
 			   __func__, rc);
 		sbi_hart_hang();
 	}
@@ -454,6 +465,10 @@ static void __noreturn init_warm_startup(struct sbi_scratch *scratch,
 		sbi_hart_hang();
 
 	rc = sbi_hart_init(scratch, false);
+	if (rc)
+		sbi_hart_hang();
+
+	rc = sbi_trap_init(scratch, false);
 	if (rc)
 		sbi_hart_hang();
 
@@ -498,10 +513,10 @@ static void __noreturn init_warm_startup(struct sbi_scratch *scratch,
 		sbi_hart_hang();
 
 	/*
-	 * Configure hart isolation at last because if SMEPMP is,
+	 * Configure hart protection at last because if SMEPMP is
 	 * detected, M-mode access to the S/U space will be rescinded.
 	 */
-	rc = sbi_hart_protection_configure(scratch);
+	rc = sbi_hart_protection_configure(scratch, sbi_domain_thishart_ptr());
 	if (rc)
 		sbi_hart_hang();
 
@@ -522,7 +537,7 @@ static void __noreturn init_warm_resume(struct sbi_scratch *scratch,
 	if (rc)
 		sbi_hart_hang();
 
-	rc = sbi_hart_protection_configure(scratch);
+	rc = sbi_hart_protection_configure(scratch, sbi_domain_thishart_ptr());
 	if (rc)
 		sbi_hart_hang();
 

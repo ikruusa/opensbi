@@ -56,7 +56,7 @@ bool atcsmu_support_sleep_mode(u32 sleep_type, u32 hartid)
 
 void atcsmu_set_command(u32 pcs_ctl, u32 hartid)
 {
-	writel_relaxed(pcs_ctl, (char *)atcsmu_base + PCSm_CTL_OFFSET(hartid));
+	writel(pcs_ctl, (char *)atcsmu_base + PCSm_CTL_OFFSET(hartid));
 }
 
 int atcsmu_set_reset_vector(u64 wakeup_addr, u32 hartid)
@@ -94,42 +94,24 @@ u32 atcsmu_read_scratch(void)
 	return readl_relaxed((char *)atcsmu_base + SCRATCH_PAD_OFFSET);
 }
 
-bool atcsmu_pcs_is_sleep(u32 hartid, bool deep_sleep)
+bool atcsmu_hart_is_sleep(void *opaque)
 {
-	u32 pcs_status = readl_relaxed((char *)atcsmu_base + PCSm_STATUS_OFFSET(hartid));
-	u32 pd_status = deep_sleep ? PD_STATUS_DEEP_SLEEP : PD_STATUS_LIGHT_SLEEP;
+	struct atcsmu_sleep_arg *arg = opaque;
 
-	if (EXTRACT_FIELD(pcs_status, PD_TYPE_MASK) != PD_TYPE_SLEEP) {
-		sbi_printf("ATCSMU: hart%d (PCS%d): failed to sleep\n", hartid, hartid + 3);
-		return false;
-	}
+	u32 pcs_status = readl_relaxed((char *)atcsmu_base +
+				       PCSm_STATUS_OFFSET(arg->hartid));
+	u32 pd_status = arg->deep_sleep ? PD_STATUS_DEEP_SLEEP :
+					  PD_STATUS_LIGHT_SLEEP;
 
-	if (EXTRACT_FIELD(pcs_status, PD_STATUS_MASK) != pd_status) {
-		sbi_printf("ATCSMU: hart%d (PCS%d): failed to enter %s sleep\n",
-			   hartid, hartid + 3, deep_sleep ? "deep" : "light");
-		return false;
-	}
-
-	return true;
+	return EXTRACT_FIELD(pcs_status, PD_TYPE_MASK) == PD_TYPE_SLEEP &&
+	       EXTRACT_FIELD(pcs_status, PD_STATUS_MASK) == pd_status;
 }
 
 static int ae350_hart_start(u32 hartid, ulong saddr)
 {
 	u32 hartindex = sbi_hartid_to_hartindex(hartid);
-	u32 sleep_type = atcsmu_get_sleep_type(hartid);
 
-	/*
-	 * Don't send wakeup command when:
-	 * 1) boot time
-	 * 2) the target hart is non-sleepable 25-series hart0
-	 * 3) light sleep
-	 */
-	if (!sbi_init_count(hartindex) || (is_andes(25) && hartid == 0) ||
-	    sleep_type == SBI_SUSP_AE350_LIGHT_SLEEP)
-		return sbi_ipi_raw_send(hartindex, false);
-
-	atcsmu_set_command(WAKEUP_CMD, hartid);
-	return 0;
+	return sbi_ipi_raw_send(hartindex, false);
 }
 
 static int ae350_hart_stop(void)
@@ -152,18 +134,19 @@ static int ae350_hart_stop(void)
 	/* Prevent the core leaving the WFI mode unexpectedly */
 	csr_write(CSR_MIE, 0);
 
+	atcsmu_set_wakeup_events(PCS_WAKEUP_MSIP_MASK | PCS_WAKEUP_MEIP_MASK, hartid);
 	if (sleep_type == SBI_SUSP_AE350_LIGHT_SLEEP) {
-		csr_write(CSR_MIE, MIP_MSIP);
-		atcsmu_set_wakeup_events(PCS_WAKEUP_MSIP_MASK, hartid);
+		/* Clock-gated only: needs MSI or MEI set to resume past the WFI */
+		csr_set(CSR_MIE, MIP_MSIP | MIP_MEIP);
 		atcsmu_set_command(LIGHT_SLEEP_CMD, hartid);
 	} else if (sleep_type == SBI_SUSP_SLEEP_TYPE_SUSPEND) {
-		atcsmu_set_wakeup_events(0x0, hartid);
-		atcsmu_set_command(DEEP_SLEEP_CMD, hartid);
+		/* Power-gated: SMU wakes it via cold reset, interrupts not needed */
 		rc = atcsmu_set_reset_vector((ulong)ae350_enable_coherency_warmboot, hartid);
 		if (rc)
 			return SBI_EFAIL;
 
 		ae350_non_ret_save(sbi_scratch_thishart_ptr());
+		atcsmu_set_command(DEEP_SLEEP_CMD, hartid);
 	}
 
 	ae350_disable_coherency();
@@ -184,18 +167,27 @@ static const struct sbi_hsm_device hsm_andes_atcsmu = {
 static int hsm_andes_atcsmu_probe(const void *fdt, int nodeoff, const struct fdt_match *match)
 {
 	int poff, rc;
-	u64 addr;
+	u64 addr, size;
 
 	/* Need to find the parent for the address property  */
 	poff = fdt_parent_offset(fdt, nodeoff);
 	if (poff < 0)
 		return SBI_EINVAL;
 
-	rc = fdt_get_node_addr_size(fdt, poff, 0, &addr, NULL);
-	if (rc < 0 || !addr)
+	rc = fdt_get_node_addr_size(fdt, poff, 0, &addr, &size);
+	if (rc < 0 || !addr || !size)
 		return SBI_ENODEV;
-	atcsmu_base = addr;
 
+	if (sbi_hart_has_extension(sbi_scratch_thishart_ptr(), SBI_HART_EXT_SMEPMP)) {
+		rc = sbi_domain_root_add_memrange(
+			(unsigned long)addr, (unsigned long)size, PAGE_SIZE,
+			SBI_DOMAIN_MEMREGION_MMIO |
+			SBI_DOMAIN_MEMREGION_SHARED_SURW_MRW);
+		if (rc)
+			return rc;
+	}
+
+	atcsmu_base = addr;
 	sbi_hsm_set_device(&hsm_andes_atcsmu);
 	return 0;
 }

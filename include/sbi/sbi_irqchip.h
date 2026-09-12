@@ -31,11 +31,16 @@ struct sbi_irqchip_device {
 	/** Internal data of all hardware interrupts of this irqchip (private) */
 	struct sbi_irqchip_hwirq_data *hwirqs;
 
-	/** List of interrupt handlers */
+	/** List of interrupt handlers (private) */
 	struct sbi_dlist handler_list;
 
 	/** Unique ID of this irqchip */
 	u32 id;
+
+	/** Capabilities of this irqchip */
+#define SBI_IRQCHIP_CAPS_WIRED		BIT(0)
+#define SBI_IRQCHIP_CAPS_MSI		BIT(1)
+	unsigned long caps;
 
 	/** Number of hardware IRQs of this irqchip */
 	u32 num_hwirq;
@@ -102,6 +107,12 @@ int sbi_irqchip_unmask_hwirq(struct sbi_irqchip_device *chip, u32 hwirq);
 /** Mask a hardware interrupt */
 int sbi_irqchip_mask_hwirq(struct sbi_irqchip_device *chip, u32 hwirq);
 
+/** Helper to set private data in sbi_irqchip_hwirq_data */
+int sbi_irqchip_set_hwirq_priv(struct sbi_irqchip_device *chip, u32 hwirq, void *priv);
+
+/** Helper to retrieve data from sbi_irqchip_hwirq_data */
+void *sbi_irqchip_get_hwirq_priv(struct sbi_irqchip_device *chip, u32 hwirq);
+
 /** Default raw hardware interrupt handler */
 int sbi_irqchip_raw_handler_default(struct sbi_irqchip_device *chip, u32 hwirq);
 
@@ -141,6 +152,10 @@ int sbi_irqchip_register_reserved(struct sbi_irqchip_device *chip,
 int sbi_irqchip_unregister_handler(struct sbi_irqchip_device *chip,
 				   u32 first_hwirq, u32 num_hwirq);
 
+/** Find an irqchip device based on matching capabilities */
+struct sbi_irqchip_device *sbi_irqchip_find_device_by_caps(unsigned long caps,
+							   struct sbi_irqchip_device *first);
+
 /** Find an irqchip device based on unique ID */
 struct sbi_irqchip_device *sbi_irqchip_find_device(u32 id);
 
@@ -152,5 +167,9 @@ int sbi_irqchip_init(struct sbi_scratch *scratch, bool cold_boot);
 
 /** Exit interrupt controllers */
 void sbi_irqchip_exit(struct sbi_scratch *scratch);
+
+/** Check if the interrupt is enabled */
+bool sbi_irqchip_is_hwirq_enabled(struct sbi_irqchip_device *chip,
+				   u32 hwirq);
 
 #endif

@@ -9,6 +9,11 @@
 
 #include <sbi/sbi_types.h>
 
+struct atcsmu_sleep_arg {
+	u32 hartid;
+	bool deep_sleep;
+};
+
 /* clang-format off */
 
 #define SCRATCH_PAD_OFFSET		0x40
@@ -36,6 +41,7 @@
 #define PCS_WAKEUP_RTC_ALARM_MASK	BIT(2)
 #define PCS_WAKEUP_UART2_MASK		BIT(9)
 #define PCS_WAKEUP_MSIP_MASK		BIT(29)
+#define PCS_WAKEUP_MEIP_MASK		BIT(31)
 
 #define PCS0_CTL_OFFSET			0x94
 #define PCSm_CTL_OFFSET(i)		((i + 3) * 0x20 + PCS0_CTL_OFFSET)
@@ -60,6 +66,6 @@ int atcsmu_set_reset_vector(u64 wakeup_addr, u32 hartid);
 u32 atcsmu_get_sleep_type(u32 hartid);
 void atcsmu_write_scratch(u32 value);
 u32 atcsmu_read_scratch(void);
-bool atcsmu_pcs_is_sleep(u32 hartid, bool deep_sleep);
+bool atcsmu_hart_is_sleep(void *opaque);
 
 #endif

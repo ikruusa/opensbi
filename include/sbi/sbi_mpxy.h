@@ -13,6 +13,7 @@
 #include <sbi/sbi_list.h>
 
 struct sbi_scratch;
+struct sbi_domain;
 
 #define SBI_MPXY_MSGPROTO_VERSION(Major, Minor) ((Major << 16) | Minor)
 
@@ -97,6 +98,8 @@ struct sbi_mpxy_channel {
 	/** List head to a set of channels */
 	struct sbi_dlist head;
 	u32 channel_id;
+
+	struct sbi_domain *owner_domain;
 	struct sbi_mpxy_channel_attrs attrs;
 
 	/**
@@ -181,5 +184,4 @@ int sbi_mpxy_send_message(u32 channel_id, u8 msg_id,
 /** Get Message proxy notification events */
 int sbi_mpxy_get_notification_events(u32 channel_id,
 					unsigned long *events_len);
-
 #endif

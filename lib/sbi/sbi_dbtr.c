@@ -24,6 +24,22 @@
 /** Offset of pointer to HART's debug triggers info in scratch space */
 static unsigned long hart_state_ptr_offset;
 
+/** Device specific debug trigger operations */
+static const struct sbi_dbtr_device *dbtr_dev = NULL;
+
+const struct sbi_dbtr_device *sbi_dbtr_get_device(void)
+{
+	return dbtr_dev;
+}
+
+void sbi_dbtr_set_device(const struct sbi_dbtr_device *dev)
+{
+	if (!dev || dbtr_dev)
+		return;
+
+	dbtr_dev = dev;
+}
+
 #define dbtr_get_hart_state_ptr(__scratch)				\
 	sbi_scratch_read_type((__scratch), void *, hart_state_ptr_offset)
 
@@ -33,6 +49,25 @@ static unsigned long hart_state_ptr_offset;
 #define dbtr_set_hart_state_ptr(__scratch, __hart_state)		\
 	sbi_scratch_write_type((__scratch), void *, hart_state_ptr_offset, \
 			       (__hart_state))
+
+#define tdata_read_safe(__csr)						\
+	({								\
+		struct sbi_trap_info __trap = {0};			\
+		csr_read_allowed((__csr), &__trap);			\
+	})
+
+#define tdata_write_safe(__csr, __value)				\
+	({								\
+		struct sbi_trap_info __trap = {0};			\
+		csr_write_allowed((__csr), &__trap, (__value));		\
+	})
+
+#define tdata_implemented(__csr)					\
+	({								\
+		struct sbi_trap_info __trap = {0};			\
+		csr_read_allowed((__csr), &__trap);			\
+		!__trap.cause;						\
+	})
 
 #define INDEX_TO_TRIGGER(_index)					\
 	({								\
@@ -86,10 +121,75 @@ static void sbi_trigger_init(struct sbi_dbtr_trigger *trig,
 	trig->index = idx;
 }
 
-static inline struct sbi_dbtr_trigger *sbi_alloc_trigger(void)
+static bool dbtr_trigger_hw_supported(unsigned long idx, unsigned long tdata1,
+				      unsigned long tdata2,
+				      unsigned long tdata3)
+{
+	if (dbtr_dev && dbtr_dev->trigger_supported)
+		return dbtr_dev->trigger_supported(idx, tdata1, tdata2,
+						   tdata3);
+
+	return true;
+}
+
+static bool dbtr_trigger_any_hw_supported(
+			struct sbi_dbtr_hart_triggers_state *hs,
+			unsigned long tdata1, unsigned long tdata2,
+			unsigned long tdata3)
+{
+	unsigned long type = TDATA1_GET_TYPE(tdata1);
+	struct sbi_dbtr_trigger *trig;
+	int i;
+
+	for (i = 0; i < hs->total_trigs; i++) {
+		trig = INDEX_TO_TRIGGER(i);
+		if (__test_bit(type, &trig->type_mask) &&
+		    dbtr_trigger_hw_supported(trig->index, tdata1, tdata2,
+					      tdata3))
+			return true;
+	}
+
+	return false;
+}
+
+/*
+ * Find the first free hardware trigger slot supporting the configuration.
+ * Slots set in claimed_mask are treated as taken, which allows the caller
+ * to track slot availability. A 32-bit mask covers RV_MAX_TRIGGERS (32);
+ * for a larger number of triggers, this function needs to be updated.
+ */
+static int dbtr_find_free_slot(struct sbi_dbtr_hart_triggers_state *hs,
+			       u32 claimed_mask,
+			       unsigned long tdata1, unsigned long tdata2,
+			       unsigned long tdata3)
+{
+	unsigned long type = TDATA1_GET_TYPE(tdata1);
+	struct sbi_dbtr_trigger *trig;
+	int i;
+
+	for (i = 0; i < hs->total_trigs; i++) {
+		trig = INDEX_TO_TRIGGER(i);
+		if (trig->state & RV_DBTR_BIT_MASK(TS, MAPPED))
+			continue;
+		if (claimed_mask & BIT(i))
+			continue;
+		if (!__test_bit(type, &trig->type_mask))
+			continue;
+		if (!dbtr_trigger_hw_supported(trig->index, tdata1,
+					       tdata2, tdata3))
+			continue;
+		return i;
+	}
+
+	return SBI_ENOENT;
+}
+
+static inline struct sbi_dbtr_trigger *sbi_alloc_trigger(unsigned long tdata1,
+							 unsigned long tdata2,
+							 unsigned long tdata3)
 {
 	int i;
-	struct sbi_dbtr_trigger *f_trig = NULL;
+	struct sbi_dbtr_trigger *f_trig;
 	struct sbi_dbtr_hart_triggers_state *hart_state;
 
 	hart_state = dbtr_thishart_state_ptr();
@@ -99,17 +199,12 @@ static inline struct sbi_dbtr_trigger *sbi_alloc_trigger(void)
 	if (hart_state->available_trigs <= 0)
 		return NULL;
 
-	for (i = 0; i < hart_state->total_trigs; i++) {
-		f_trig = INDEX_TO_TRIGGER(i);
-		if (f_trig->state & RV_DBTR_BIT_MASK(TS, MAPPED))
-			continue;
-		hart_state->available_trigs--;
-		break;
-	}
-
-	if (i == hart_state->total_trigs)
+	i = dbtr_find_free_slot(hart_state, 0, tdata1, tdata2, tdata3);
+	if (i < 0)
 		return NULL;
 
+	f_trig = INDEX_TO_TRIGGER(i);
+	hart_state->available_trigs--;
 	__set_bit(RV_DBTR_BIT(TS, MAPPED), &f_trig->state);
 
 	return f_trig;
@@ -418,7 +513,8 @@ static void dbtr_trigger_enable(struct sbi_dbtr_trigger *trig)
 	 */
 	csr_write(CSR_TSELECT, trig->index);
 	csr_write(CSR_TDATA1, 0x0);
-	csr_write(CSR_TDATA2, trig->tdata2);
+	tdata_write_safe(CSR_TDATA2, trig->tdata2);
+	tdata_write_safe(CSR_TDATA3, trig->tdata3);
 	csr_write(CSR_TDATA1, trig->tdata1);
 }
 
@@ -463,7 +559,8 @@ static void dbtr_trigger_clear(struct sbi_dbtr_trigger *trig)
 
 	csr_write(CSR_TSELECT, trig->index);
 	csr_write(CSR_TDATA1, 0x0);
-	csr_write(CSR_TDATA2, 0x0);
+	tdata_write_safe(CSR_TDATA2, 0x0);
+	tdata_write_safe(CSR_TDATA3, 0x0);
 }
 
 static int dbtr_trigger_supported(unsigned long type)
@@ -526,7 +623,8 @@ int sbi_dbtr_num_trig(unsigned long data, unsigned long *out)
 	for (i = 0; i < hs->total_trigs; i++) {
 		trig = INDEX_TO_TRIGGER(i);
 
-		if (__test_bit(type, &trig->type_mask))
+		if (__test_bit(type, &trig->type_mask) &&
+		    dbtr_trigger_hw_supported(trig->index, data, 0, 0))
 			total++;
 	}
 
@@ -552,29 +650,29 @@ int sbi_dbtr_read_trig(unsigned long smode,
 
 	if (trig_idx_base >= hs->total_trigs ||
 	    trig_idx_base + trig_count >= hs->total_trigs)
-		return SBI_ERR_INVALID_PARAM;
+		return SBI_ERR_BAD_RANGE;
 
 	if (sbi_dbtr_shmem_disabled(hs))
 		return SBI_ERR_NO_SHMEM;
 
 	shmem_base = hart_shmem_base(hs);
 
-	sbi_hart_protection_map_range((unsigned long)shmem_base,
-				      trig_count * sizeof(*entry));
+	sbi_hart_protection_temp_map_range((unsigned long)shmem_base,
+					   trig_count * sizeof(*entry));
 	for_each_trig_entry(shmem_base, trig_count, typeof(*entry), entry) {
 		xmit = &entry->data;
 		trig = INDEX_TO_TRIGGER((_idx + trig_idx_base));
 		csr_write(CSR_TSELECT, trig->index);
 		trig->tdata1 = csr_read(CSR_TDATA1);
-		trig->tdata2 = csr_read(CSR_TDATA2);
-		trig->tdata3 = csr_read(CSR_TDATA3);
+		trig->tdata2 = tdata_read_safe(CSR_TDATA2);
+		trig->tdata3 = tdata_read_safe(CSR_TDATA3);
 		xmit->tstate = cpu_to_lle(trig->state);
 		xmit->tdata1 = cpu_to_lle(trig->tdata1);
 		xmit->tdata2 = cpu_to_lle(trig->tdata2);
 		xmit->tdata3 = cpu_to_lle(trig->tdata3);
 	}
-	sbi_hart_protection_unmap_range((unsigned long)shmem_base,
-					trig_count * sizeof(*entry));
+	sbi_hart_protection_temp_unmap_range((unsigned long)shmem_base,
+					     trig_count * sizeof(*entry));
 
 	return SBI_SUCCESS;
 }
@@ -587,8 +685,11 @@ int sbi_dbtr_install_trig(unsigned long smode,
 	struct sbi_dbtr_data_msg *recv;
 	struct sbi_dbtr_id_msg *xmit;
 	unsigned long ctrl;
+	u32 claimed = 0;
+	int slot;
 	struct sbi_dbtr_trigger *trig;
 	struct sbi_dbtr_hart_triggers_state *hs = NULL;
+	bool tdata2_impl, tdata3_impl;
 
 	hs = dbtr_thishart_state_ptr();
 	if (!hs)
@@ -598,8 +699,19 @@ int sbi_dbtr_install_trig(unsigned long smode,
 		return SBI_ERR_NO_SHMEM;
 
 	shmem_base = hart_shmem_base(hs);
-	sbi_hart_protection_map_range((unsigned long)shmem_base,
-				      trig_count * sizeof(*entry));
+	sbi_hart_protection_temp_map_range((unsigned long)shmem_base,
+					   trig_count * sizeof(*entry));
+
+	/*
+	 * SBI v3.0 sec 19.4 requires SBI_ERR_NOT_SUPPORTED when a trigger
+	 * programs a non-zero value into an unimplemented optional CSR. Only
+	 * the "whole CSR unimplemented" case is caught here; WARL bits tied
+	 * off inside an otherwise-implemented CSR are delegated to the
+	 * device-specific trigger_supported() callback via
+	 * dbtr_trigger_any_hw_supported().
+	 */
+	tdata2_impl = tdata_implemented(CSR_TDATA2);
+	tdata3_impl = tdata_implemented(CSR_TDATA3);
 
 	/* Check requested triggers configuration */
 	for_each_trig_entry(shmem_base, trig_count, typeof(*entry), entry) {
@@ -608,36 +720,77 @@ int sbi_dbtr_install_trig(unsigned long smode,
 
 		if (!dbtr_trigger_supported(TDATA1_GET_TYPE(ctrl))) {
 			*out = _idx;
-			sbi_hart_protection_unmap_range((unsigned long)shmem_base,
-							trig_count * sizeof(*entry));
+			sbi_hart_protection_temp_unmap_range((unsigned long)shmem_base,
+							     trig_count * sizeof(*entry));
 			return SBI_ERR_FAILED;
 		}
 
 		if (!dbtr_trigger_valid(TDATA1_GET_TYPE(ctrl), ctrl)) {
 			*out = _idx;
-			sbi_hart_protection_unmap_range((unsigned long)shmem_base,
-							trig_count * sizeof(*entry));
-			return SBI_ERR_FAILED;
+			sbi_hart_protection_temp_unmap_range((unsigned long)shmem_base,
+							     trig_count * sizeof(*entry));
+			return SBI_ERR_INVALID_PARAM;
+		}
+
+		if ((recv->tdata2 && !tdata2_impl) ||
+		    (recv->tdata3 && !tdata3_impl)) {
+			*out = _idx;
+			sbi_hart_protection_temp_unmap_range((unsigned long)shmem_base,
+							     trig_count * sizeof(*entry));
+			return SBI_ERR_NOT_SUPPORTED;
+		}
+
+		if (!dbtr_trigger_any_hw_supported(hs,
+						   lle_to_cpu(recv->tdata1),
+						   lle_to_cpu(recv->tdata2),
+						   lle_to_cpu(recv->tdata3))) {
+			*out = _idx;
+			sbi_hart_protection_temp_unmap_range((unsigned long)shmem_base,
+							     trig_count * sizeof(*entry));
+			return SBI_ERR_NOT_SUPPORTED;
 		}
 	}
 
 	if (hs->available_trigs < trig_count) {
 		*out = hs->available_trigs;
-		sbi_hart_protection_unmap_range((unsigned long)shmem_base,
-					       trig_count * sizeof(*entry));
+		sbi_hart_protection_temp_unmap_range((unsigned long)shmem_base,
+						     trig_count * sizeof(*entry));
 		return SBI_ERR_FAILED;
+	}
+
+	/*
+	 * Dry-run the allocation of the whole batch so that no trigger
+	 * is installed if any of the requested configurations cannot be
+	 * matched to a free hardware trigger slot.
+	 */
+	for_each_trig_entry(shmem_base, trig_count, typeof(*entry), entry) {
+		recv = (struct sbi_dbtr_data_msg *)(&entry->data);
+		slot = dbtr_find_free_slot(hs, claimed,
+					   lle_to_cpu(recv->tdata1),
+					   lle_to_cpu(recv->tdata2),
+					   lle_to_cpu(recv->tdata3));
+		if (slot < 0) {
+			*out = _idx;
+			sbi_hart_protection_temp_unmap_range((unsigned long)shmem_base,
+							     trig_count * sizeof(*entry));
+			return SBI_ERR_FAILED;
+		}
+		claimed |= BIT(slot);
 	}
 
 	/* Install triggers */
 	for_each_trig_entry(shmem_base, trig_count, typeof(*entry), entry) {
-		/*
-		 * Since we have already checked if enough triggers are
-		 * available, trigger allocation must succeed.
-		 */
-		trig = sbi_alloc_trigger();
-
 		recv = (struct sbi_dbtr_data_msg *)(&entry->data);
 		xmit = (struct sbi_dbtr_id_msg *)(&entry->id);
+
+		/*
+		 * The dry-run above matched every requested configuration
+		 * to a free hardware trigger slot, so allocation must
+		 * succeed.
+		 */
+		trig = sbi_alloc_trigger(lle_to_cpu(recv->tdata1),
+					 lle_to_cpu(recv->tdata2),
+					 lle_to_cpu(recv->tdata3));
 
 		dbtr_trigger_setup(trig,  recv);
 		dbtr_trigger_enable(trig);
@@ -645,8 +798,8 @@ int sbi_dbtr_install_trig(unsigned long smode,
 
 	}
 
-	sbi_hart_protection_unmap_range((unsigned long)shmem_base,
-					trig_count * sizeof(*entry));
+	sbi_hart_protection_temp_unmap_range((unsigned long)shmem_base,
+					     trig_count * sizeof(*entry));
 
 	return SBI_SUCCESS;
 }
@@ -705,6 +858,7 @@ int sbi_dbtr_update_trig(unsigned long smode,
 	union sbi_dbtr_shmem_entry *entry;
 	void *shmem_base = NULL;
 	struct sbi_dbtr_hart_triggers_state *hs = NULL;
+	bool tdata2_impl, tdata3_impl;
 
 	hs = dbtr_thishart_state_ptr();
 	if (!hs)
@@ -718,24 +872,47 @@ int sbi_dbtr_update_trig(unsigned long smode,
 	if (trig_count >= hs->total_trigs)
 		return SBI_ERR_BAD_RANGE;
 
+	/*
+	 * SBI v3.0 sec 19.5 requires SBI_ERR_NOT_SUPPORTED when a trigger
+	 * programs a non-zero value into an unimplemented optional CSR. Only
+	 * the "whole CSR unimplemented" case is caught; WARL bits tied off
+	 * inside an otherwise-implemented CSR are not.
+	 */
+	tdata2_impl = tdata_implemented(CSR_TDATA2);
+	tdata3_impl = tdata_implemented(CSR_TDATA3);
+
 	for_each_trig_entry(shmem_base, trig_count, typeof(*entry), entry) {
-		sbi_hart_protection_map_range((unsigned long)entry, sizeof(*entry));
+		sbi_hart_protection_temp_map_range((unsigned long)entry, sizeof(*entry));
 		trig_idx = entry->id.idx;
 
 		if (trig_idx >= hs->total_trigs) {
-			sbi_hart_protection_unmap_range((unsigned long)entry, sizeof(*entry));
+			sbi_hart_protection_temp_unmap_range((unsigned long)entry, sizeof(*entry));
 			return SBI_ERR_INVALID_PARAM;
 		}
 
 		trig = INDEX_TO_TRIGGER(trig_idx);
 
 		if (!(trig->state & RV_DBTR_BIT_MASK(TS, MAPPED))) {
-			sbi_hart_protection_unmap_range((unsigned long)entry, sizeof(*entry));
+			sbi_hart_protection_temp_unmap_range((unsigned long)entry, sizeof(*entry));
 			return SBI_ERR_FAILED;
 		}
 
+		if ((entry->data.tdata2 && !tdata2_impl) ||
+		    (entry->data.tdata3 && !tdata3_impl)) {
+			sbi_hart_protection_temp_unmap_range((unsigned long)entry, sizeof(*entry));
+			return SBI_ERR_NOT_SUPPORTED;
+		}
+
+		if (!dbtr_trigger_hw_supported(trig->index,
+					       lle_to_cpu(entry->data.tdata1),
+					       lle_to_cpu(entry->data.tdata2),
+					       lle_to_cpu(entry->data.tdata3))) {
+			sbi_hart_protection_temp_unmap_range((unsigned long)entry, sizeof(*entry));
+			return SBI_ERR_NOT_SUPPORTED;
+		}
+
 		dbtr_trigger_setup(trig, &entry->data);
-		sbi_hart_protection_unmap_range((unsigned long)entry, sizeof(*entry));
+		sbi_hart_protection_temp_unmap_range((unsigned long)entry, sizeof(*entry));
 		dbtr_trigger_enable(trig);
 	}
 
